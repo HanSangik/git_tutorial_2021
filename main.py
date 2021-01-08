@@ -1,230 +1,235 @@
-import torch
-import torch.nn as nn
-from torch.distributions import MultivariateNormal
-import gym
+import glob
+import os
+import sys
+import random
+import time
 import numpy as np
+import cv2
+import math
+from collections import deque
+from keras.applications.xception import Xception
+from keras.layers import Dense, GlobalAveragePooling2D
+from keras.optimizers import Adam
+from keras.models import Model
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+try:
+    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
+except IndexError:
+    pass
+import carla
 
 
-class Memory:
+SHOW_PREVIEW = False
+IM_WIDTH = 640
+IM_HEIGHT = 480
+SECONDS_PER_EPISODE = 10
+REPLAY_MEMORY_SIZE = 5_000
+MIN_REPLAY_MEMORY_SIZE = 1_000
+MINIBATCH_SIZE = 16
+PREDICTION_BATCH_SIZE = 1
+TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
+UPDATE_TARGET_EVERY = 5
+MODEL_NAME = "Xception"
+
+MEMORY_FRACTION = 0.8
+MIN_REWARD = -200
+
+EPISODES = 100
+
+DISCOUNT = 0.99
+epsilon = 1
+EPSILON_DECAY = 0.95 ## 0.9975 99975
+MIN_EPSILON = 0.001
+
+AGGREGATE_STATS_EVERY = 10
+
+
+
+
+
+
+class CarEnv:
+    SHOW_CAM = SHOW_PREVIEW
+    STEER_AMT = 1.0
+    im_width = IM_WIDTH
+    im_height = IM_HEIGHT
+    front_camera = None
+
     def __init__(self):
-        self.actions = []
-        self.states = []
-        self.logprobs = []
-        self.rewards = []
-        self.is_terminals = []
+        self.client = carla.Client("localhost", 2000)
+        self.client.set_timeout(2.0)
+        self.world = self.client.get_world()
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.model_3 = self.blueprint_library.filter("model3")[0]
 
-    def clear_memory(self):
-        del self.actions[:]
-        del self.states[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.is_terminals[:]
+    def reset(self):
+        self.collision_hist = []
+        self.actor_list = []
 
+        self.transform = random.choice(self.world.get_map().get_spawn_points())
+        self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
+        self.actor_list.append(self.vehicle)
 
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, action_std):
-        super(ActorCritic, self).__init__()
-        # action mean range -1 to 1
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, action_dim),
-            nn.Tanh()
-        )
-        # critic
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1)
-        )
-        self.action_var = torch.full((action_dim,), action_std * action_std).to(device)
+        self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
+        self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
+        self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
+        self.rgb_cam.set_attribute("fov", f"110")
 
-    def forward(self):
-        raise NotImplementedError
+        transform = carla.Transform(carla.Location(x=2.5, z=0.7))
+        self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
+        self.actor_list.append(self.sensor)
+        self.sensor.listen(lambda data: self.process_img(data))
 
-    def act(self, state, memory):
-        action_mean = self.actor(state)
-        cov_mat = torch.diag(self.action_var).to(device)
+        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
+        time.sleep(4)
 
-        dist = MultivariateNormal(action_mean, cov_mat)
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
+        colsensor = self.blueprint_library.find("sensor.other.collision")
+        self.colsensor = self.world.spawn_actor(colsensor, transform, attach_to=self.vehicle)
+        self.actor_list.append(self.colsensor)
+        self.colsensor.listen(lambda event: self.collision_data(event))
 
-        memory.states.append(state)
-        memory.actions.append(action)
-        memory.logprobs.append(action_logprob)
+        while self.front_camera is None:
+            time.sleep(0.01)
 
-        return action.detach()
+        self.episode_start = time.time()
+        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
-    def evaluate(self, state, action):
-        action_mean = self.actor(state)
+        return self.front_camera
 
-        action_var = self.action_var.expand_as(action_mean)
-        cov_mat = torch.diag_embed(action_var).to(device)
+    def collision_data(self, event):
+        self.collision_hist.append(event)
 
-        dist = MultivariateNormal(action_mean, cov_mat)
+    def process_img(self, image):
+        i = np.array(image.raw_data)
+        #print(i.shape)
+        i2 = i.reshape((self.im_height, self.im_width, 4))
+        i3 = i2[:, :, :3]
+        if self.SHOW_CAM:
+            cv2.imshow("", i3)
+            cv2.waitKey(1)
+        self.front_camera = i3
 
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_value = self.critic(state)
+    def step(self, action):
+        if action == 0:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=-1*self.STEER_AMT))
+        elif action == 1:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer= 0))
+        elif action == 2:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, steer=1*self.STEER_AMT))
 
-        return action_logprobs, torch.squeeze(state_value), dist_entropy
+        v = self.vehicle.get_velocity()
+        kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
 
+        if len(self.collision_hist) != 0:
+            done = True
+            reward = -200
+        elif kmh < 50:
+            done = False
+            reward = -1
+        else:
+            done = False
+            reward = 1
 
-class PPO:
-    def __init__(self, state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip):
-        self.lr = lr
-        self.betas = betas
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
+        if self.episode_start + SECONDS_PER_EPISODE < time.time():
+            done = True
 
-        self.policy = ActorCritic(state_dim, action_dim, action_std).to(device)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=betas)
-
-        self.policy_old = ActorCritic(state_dim, action_dim, action_std).to(device)
-        self.policy_old.load_state_dict(self.policy.state_dict())
-
-        self.MseLoss = nn.MSELoss()
-
-    def select_action(self, state, memory):
-        state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-        return self.policy_old.act(state, memory).cpu().data.numpy().flatten()
-
-    def update(self, memory):
-        # Monte Carlo estimate of rewards:
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-
-        # Normalizing the rewards:
-        rewards = torch.tensor(rewards).to(device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
-
-        # convert list to tensor
-        old_states = torch.squeeze(torch.stack(memory.states).to(device), 1).detach()
-        old_actions = torch.squeeze(torch.stack(memory.actions).to(device), 1).detach()
-        old_logprobs = torch.squeeze(torch.stack(memory.logprobs), 1).to(device).detach()
-
-        # Optimize policy for K epochs:
-        for _ in range(self.K_epochs):
-            # Evaluating old actions and values :
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
-
-            # Finding the ratio (pi_theta / pi_theta__old):
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            # Finding Surrogate Loss:
-            advantages = rewards - state_values.detach()
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
-
-            # take gradient step
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
-
-        # Copy new weights into old policy:
-        self.policy_old.load_state_dict(self.policy.state_dict())
+        return self.front_camera, reward, done, None
 
 
-def main():
-    ############## Hyperparameters ##############
-    env_name = "BipedalWalker-v2"
-    render = False
-    solved_reward = 300  # stop training if avg_reward > solved_reward
-    log_interval = 20  # print avg reward in the interval
-    max_episodes = 10000  # max training episodes
-    max_timesteps = 1500  # max timesteps in one episode
+class DQNAgent:
+    def __init__(self):
+        self.model = self.create_model()
+        self.target_model = self.create_model()
+        self.target_model.set_weights(self.model.get_weights())
 
-    update_timestep = 4000  # update policy every n timesteps
-    action_std = 0.5  # constant std for action distribution (Multivariate Normal)
-    K_epochs = 80  # update policy for K epochs
-    eps_clip = 0.2  # clip parameter for PPO
-    gamma = 0.99  # discount factor
+        self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)
 
-    lr = 0.0003  # parameters for Adam optimizer
-    betas = (0.9, 0.999)
+        self.tensorboard = ModifiedTensorBoard(log_dir=f"logs/{MODEL_NAME}-{int(time.time())}")
+        self.target_update_counter = 0
+        self.graph = tf.get_default_graph()
 
-    random_seed = None
-    #############################################
+        self.terminate = False
+        self.last_logged_episode = 0
+        self.training_initialized = False
 
-    # creating environment
-    env = gym.make(env_name)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    def create_model(self):
+        base_model = Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3))
 
-    if random_seed:
-        print("Random Seed: {}".format(random_seed))
-        torch.manual_seed(random_seed)
-        env.seed(random_seed)
-        np.random.seed(random_seed)
+        x = base_model.output
+        x = GlobalAveragePooling2D()(x)
 
-    memory = Memory()
-    ppo = PPO(state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip)
-    print(lr, betas)
+        predictions = Dense(3, activation="linear")(x)
+        model = Model(inputs=base_model.input, outputs=predictions)
+        model.compile(loss="mse", optimizer=Adam(lr=0.001), metrics=["accuracy"])
+        return model
 
-    # logging variables
-    running_reward = 0
-    avg_length = 0
-    time_step = 0
+    def update_replay_memory(self, transition):
+        # transition = (current_state, action, reward, new_state, done)
+        self.replay_memory.append(transition)
 
-    # training loop
-    for i_episode in range(1, max_episodes + 1):
-        state = env.reset()
-        for t in range(max_timesteps):
-            time_step += 1
-            # Running policy_old:
-            action = ppo.select_action(state, memory)
-            state, reward, done, _ = env.step(action)
+    def train(self):
+        if len(self.replay_memory) < MIN_REPLAY_MEMORY_SIZE:
+            return
 
-            # Saving reward and is_terminals:
-            memory.rewards.append(reward)
-            memory.is_terminals.append(done)
+        minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
-            # update if its time
-            if time_step % update_timestep == 0:
-                ppo.update(memory)
-                memory.clear_memory()
-                time_step = 0
-            running_reward += reward
-            if render:
-                env.render()
-            if done:
-                break
+        current_states = np.array([transition[0] for transition in minibatch])/255
+        with self.graph.as_default():
+            current_qs_list = self.model.predict(current_states, PREDICTION_BATCH_SIZE)
 
-        avg_length += t
+        new_current_states = np.array([transition[3] for transition in minibatch])/255
+        with self.graph.as_default():
+            future_qs_list = self.target_model.predict(new_current_states, PREDICTION_BATCH_SIZE)
 
-        # stop training if avg_reward > solved_reward
-        if running_reward > (log_interval * solved_reward):
-            print("########## Solved! ##########")
-            torch.save(ppo.policy.state_dict(), './PPO_continuous_solved_{}.pth'.format(env_name))
-            break
+        X = []
+        y = []
 
-        # save every 500 episodes
-        if i_episode % 500 == 0:
-            torch.save(ppo.policy.state_dict(), './PPO_continuous_{}.pth'.format(env_name))
+        for index, (current_state, action, reward, new_state, done) in enumerate(minibatch):
+            if not done:
+                max_future_q = np.max(future_qs_list[index])
+                new_q = reward + DISCOUNT * max_future_q
+            else:
+                new_q = reward
 
-        # logging
-        if i_episode % log_interval == 0:
-            avg_length = int(avg_length / log_interval)
-            running_reward = int((running_reward / log_interval))
+            current_qs = current_qs_list[index]
+            current_qs[action] = new_q
 
-            print('Episode {} \t Avg length: {} \t Avg reward: {}'.format(i_episode, avg_length, running_reward))
-            running_reward = 0
-            avg_length = 0
+            X.append(current_state)
+            y.append(current_qs)
+
+        log_this_step = False
+        if self.tensorboard.step > self.last_logged_episode:
+            log_this_step = True
+            self.last_log_episode = self.tensorboard.step
+
+        with self.graph.as_default():
+            self.model.fit(np.array(X)/255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0, shuffle=False, callbacks=[self.tensorboard] if log_this_step else None)
 
 
-if __name__ == '__main__':
-    main()
+        if log_this_step:
+            self.target_update_counter += 1
+
+        if self.target_update_counter > UPDATE_TARGET_EVERY:
+            self.target_model.set_weights(self.model.get_weights())
+            self.target_update_counter = 0
+
+    def get_qs(self, state):
+        return self.model.predict(np.array(state).reshape(-1, *state.shape)/255)[0]
+
+    def train_in_loop(self):
+        X = np.random.uniform(size=(1, IM_HEIGHT, IM_WIDTH, 3)).astype(np.float32)
+        y = np.random.uniform(size=(1, 3)).astype(np.float32)
+        with self.graph.as_default():
+            self.model.fit(X,y, verbose=False, batch_size=1)
+
+        self.training_initialized = True
+
+        while True:
+            if self.terminate:
+                return
+            self.train()
+            time.sleep(0.01)
